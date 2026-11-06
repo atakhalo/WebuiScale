@@ -397,6 +397,12 @@ class UpscaleWorker:
                     self.log_callback(f"   放大系数: {scale}x → {width} x {height}")
                 else:
                     resize_mode = 1  # 按目标尺寸
+                    # 宽高比识别: 竖屏图片遇到横屏目标尺寸时自动交换宽高
+                    if (config.auto_swap_wh and width > 0 and height > 0
+                            and original_image.height > original_image.width
+                            and width > height):
+                        width, height = height, width
+                        self.log_callback(f"   ↕ 竖屏图片 + 横屏目标，已自动交换宽高 → {width} x {height}")
                     self.log_callback(f"   目标尺寸: {width} x {height}")
 
                 # 调用 WebUI API 放大
@@ -470,6 +476,7 @@ class Config:
         self.output_dir = ''
         self.target_width = 0
         self.target_height = 0
+        self.auto_swap_wh = False      # 竖屏图片遇横屏目标尺寸时自动交换宽高
         self.scale_factor = 2.0
         self.upscaler_name = '4x-AnimeSharp'
         self.host = '127.0.0.1'
@@ -739,44 +746,53 @@ class UpscaleGUI:
         param_frame = ttk.LabelFrame(settings_tab, text="放大参数", padding="10")
         param_frame.pack(fill=tk.X, pady=5)
 
-        # 第一行: 目标尺寸 + 交换 + 提示
-        ttk.Label(param_frame, text="目标宽度:").grid(row=0, column=0, sticky=tk.W)
+        # 第一行: 宽高比识别自动交换（目标宽度上方）
+        self.auto_swap_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(param_frame, text="宽高比识别自动交换",
+                        variable=self.auto_swap_var).grid(
+            row=0, column=0, sticky=tk.W)
+        ttk.Label(param_frame, text="（竖屏图片遇横屏目标尺寸时，自动交换目标宽高）",
+                  foreground="#888", font=('', 8)).grid(
+            row=0, column=1, columnspan=4, sticky=tk.W, padx=(6, 0))
+
+        # 第二行: 目标尺寸 + 提示
+        ttk.Label(param_frame, text="目标宽度:").grid(row=1, column=0, sticky=tk.W)
         self.width_var = tk.StringVar(value="0")
-        ttk.Entry(param_frame, textvariable=self.width_var, width=8).grid(row=0, column=1, sticky=tk.W, padx=(5, 3))
+        ttk.Entry(param_frame, textvariable=self.width_var, width=8).grid(row=1, column=1, sticky=tk.W, padx=(5, 3))
 
-        # ttk.Label(param_frame, text="×").grid(row=0, column=2, sticky=tk.W)
+        # ttk.Label(param_frame, text="×").grid(row=1, column=2, sticky=tk.W)
 
-        ttk.Label(param_frame, text="目标高度:").grid(row=0, column=2, sticky=tk.W)
+        ttk.Label(param_frame, text="目标高度:").grid(row=1, column=2, sticky=tk.W)
         self.height_var = tk.StringVar(value="0")
-        ttk.Entry(param_frame, textvariable=self.height_var, width=8).grid(row=0, column=3, sticky=tk.W, padx=(5, 5))
-
-        ttk.Button(param_frame, text="↔ 交换", width=7,
-                   command=self._swap_wh).grid(row=1, column=0, sticky=tk.W, padx=(0, 10))
+        ttk.Entry(param_frame, textvariable=self.height_var, width=8).grid(row=1, column=3, sticky=tk.W, padx=(5, 5))
 
         ttk.Label(param_frame, text="（宽高填 0 则使用下方缩放系数）",
-                  foreground="#888").grid(row=0, column=4, sticky=tk.W)
+                  foreground="#888").grid(row=1, column=4, sticky=tk.W)
 
-        # 第二行: 预设按钮
+        # 第三行: 交换 + 预设按钮
+        ttk.Button(param_frame, text="↔ 交换", width=7,
+                   command=self._swap_wh).grid(row=2, column=0, sticky=tk.W, padx=(0, 10))
+
         presets = [("2560×1440", 2560, 1440), ("1920×1080", 1920, 1080), ("3840×2160", 3840, 2160)]
         for i, (label, w, h) in enumerate(presets):
             btn = ttk.Button(param_frame, text=label, width=12,
                              command=lambda w=w, h=h: self._set_preset(w, h))
-            btn.grid(row=1, column=i+1, sticky=tk.W, padx=(0, 5), pady=(0, 3))
+            btn.grid(row=2, column=i+1, sticky=tk.W, padx=(0, 5), pady=(0, 3))
 
-        # 第三行: 缩放系数 + 算法
-        ttk.Label(param_frame, text="缩放系数:").grid(row=2, column=0, sticky=tk.W, pady=(3, 0))
+        # 第四行: 缩放系数 + 算法
+        ttk.Label(param_frame, text="缩放系数:").grid(row=3, column=0, sticky=tk.W, pady=(3, 0))
         self.scale_var = tk.StringVar(value="2.0")
-        ttk.Entry(param_frame, textvariable=self.scale_var, width=8).grid(row=2, column=1, sticky=tk.W, padx=(5, 15), pady=(3, 0))
+        ttk.Entry(param_frame, textvariable=self.scale_var, width=8).grid(row=3, column=1, sticky=tk.W, padx=(5, 15), pady=(3, 0))
 
-        ttk.Label(param_frame, text="放大算法:").grid(row=2, column=2, sticky=tk.W, pady=(3, 0))
+        ttk.Label(param_frame, text="放大算法:").grid(row=3, column=2, sticky=tk.W, pady=(3, 0))
         self.upscaler_var = tk.StringVar(value="4x-UltraSharp")
         upscalers = ["4x-AnimeSharp", "4x-UltraSharp", "R-ESRGAN 4x+", "R-ESRGAN 4x Anime6B",
                      "SwinIR 4x", "ESRGAN_4x", "LDSR", "ScuNET", "None"]
         ttk.Combobox(param_frame, textvariable=self.upscaler_var, values=upscalers, width=22).grid(
-            row=2, column=3, sticky=tk.W, padx=(5, 5), pady=(3, 0))
+            row=3, column=3, sticky=tk.W, padx=(5, 5), pady=(3, 0))
 
         ttk.Label(param_frame, text="⚠ 请自主检查webui是否支持", foreground="#888").grid(
-            row=2, column=4, sticky=tk.W, padx=(2, 0), pady=(3, 0))
+            row=3, column=4, sticky=tk.W, padx=(2, 0), pady=(3, 0))
 
         param_frame.columnconfigure(4, weight=1)
 
@@ -1017,6 +1033,8 @@ class UpscaleGUI:
             self._log("❌ 目标宽度/高度必须为整数")
             return
 
+        self.config.auto_swap_wh = self.auto_swap_var.get()
+
         # 解析缩放系数
         try:
             self.config.scale_factor = float(self.scale_var.get())
@@ -1072,6 +1090,7 @@ class UpscaleGUI:
                 # 放大参数
                 'target_width': self.config.target_width,
                 'target_height': self.config.target_height,
+                'auto_swap_wh': self.config.auto_swap_wh,
                 'scale_factor': self.config.scale_factor,
                 'upscaler_name': self.config.upscaler_name,
                 # 保存质量
@@ -1202,6 +1221,8 @@ class UpscaleGUI:
             self.width_var.set(str(data['target_width']))
         if 'target_height' in data:
             self.height_var.set(str(data['target_height']))
+        if 'auto_swap_wh' in data:
+            self.auto_swap_var.set(data['auto_swap_wh'])
         if 'scale_factor' in data:
             self.scale_var.set(str(data['scale_factor']))
         if 'upscaler_name' in data:
