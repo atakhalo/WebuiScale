@@ -22,40 +22,52 @@ from pathlib import Path
 import traceback
 
 import webuiapi
-from PIL import Image
+from PIL import Image, PngImagePlugin
 import piexif
 
 
 # ==================== 元数据处理 ====================
 
+# PNG 中的非文本块（不能作为 tEXt 写回，读取时跳过）
+_PNG_INFO_SKIP_KEYS = {
+    'dpi', 'gamma', 'icc_profile', 'chromaticity', 'exif', 'transparency',
+    'interlace', 'compression', 'srgb', 'background', 'loop', 'duration',
+    'default_image', 'aspect',
+}
+
+
 def extract_metadata(image_path):
-    """提取图片元数据（EXIF + PNG tEXt 块）"""
+    """提取图片元数据（EXIF + PNG tEXt 块）。
+
+    原图没有元数据时返回空字典（不抛异常），保存时按无元数据处理。
+    """
     metadata = {}
     ext = os.path.splitext(image_path)[1].lower()
 
     try:
-        img = Image.open(image_path)
-
-        # PNG: 提取 tEXt 块信息（如 WebUI 的 parameters、ComfyUI 的 prompt/workflow）
-        if ext == '.png':
-            png_info = {}
-            for key, value in img.info.items():
-                if key not in ('dpi', 'gamma', 'icc_profile', 'chromaticity', 'exif'):
-                    # Pillow 要求 tEXt 的值必须为字符串
+        with Image.open(image_path) as img:
+            # PNG: 提取 tEXt 块信息（如 WebUI 的 parameters、ComfyUI 的 prompt/workflow）
+            if ext == '.png':
+                png_info = {}
+                for key, value in img.info.items():
+                    if key in _PNG_INFO_SKIP_KEYS:
+                        continue
                     if isinstance(value, bytes):
                         try:
-                            value = value.decode('utf-8', errors='replace')
-                        except Exception:
+                            value = value.decode('utf-8')
+                        except UnicodeDecodeError:
+                            # 二进制块不当作文本保存
                             continue
-                    png_info[key] = value
-            if png_info:
-                metadata['png_info'] = png_info
+                    # Pillow 要求 tEXt 的键值均为字符串
+                    if isinstance(value, str) and value:
+                        png_info[key] = value
+                if png_info:
+                    metadata['png_info'] = png_info
 
-        # EXIF（适用于 PNG/JPEG/WebP）
-        if 'exif' in img.info and img.info['exif']:
-            metadata['exif'] = img.info['exif']
-
-        img.close()
+            # EXIF（适用于 PNG/JPEG/WebP）
+            exif = img.info.get('exif')
+            if exif:
+                metadata['exif'] = exif
     except Exception as e:
         print(f"   ⚠ 读取元数据警告: {e}")
 
@@ -71,36 +83,75 @@ def extract_metadata(image_path):
     return metadata
 
 
+def _build_pnginfo(png_info):
+    """把文本字典转换为 Pillow 的 PngInfo 对象（不能直接传 dict）。"""
+    info = PngImagePlugin.PngInfo()
+    for key, value in (png_info or {}).items():
+        if not isinstance(key, str) or not key:
+            continue
+        if isinstance(value, bytes):
+            try:
+                value = value.decode('utf-8')
+            except UnicodeDecodeError:
+                continue
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            info.add_text(key, value)
+        except Exception:
+            continue
+    return info
+
+
+def _flatten_for_jpeg(image):
+    """JPEG 不支持透明通道，带透明的图合成到白底。"""
+    if image.mode in ('RGB', 'L', 'CMYK'):
+        return image
+    has_alpha = ('A' in image.getbands()
+                 or (image.mode == 'P' and 'transparency' in image.info))
+    if has_alpha:
+        rgba = image.convert('RGBA')
+        background = Image.new('RGB', rgba.size, (255, 255, 255))
+        background.paste(rgba, mask=rgba.getchannel('A'))
+        return background
+    return image.convert('RGB')
+
+
 def save_with_metadata(image, output_path, metadata, save_mode='lossy', quality=90, webp_method=6):
-    """保存图片并嵌入元数据"""
+    """保存图片并嵌入元数据。
+
+    metadata 为空（原图无元数据）时同样正常工作：不写入任何元数据块。
+    输出格式由 output_path 的扩展名决定。
+    """
     ext = os.path.splitext(output_path)[1].lower()
     is_lossless = (save_mode == 'lossless')
+    metadata = metadata or {}
+    exif = metadata.get('exif') or None
 
     if ext == '.png':
-        png_info = metadata.get('png_info', {}).copy()
-        if 'exif' in metadata:
-            exif_data = metadata['exif']
-            if isinstance(exif_data, bytes):
-                png_info['exif'] = exif_data
-        image.save(
-            output_path, format='PNG',
-            pnginfo=png_info if png_info else None,
-            optimize=is_lossless,
-        )
+        # pnginfo 必须是 PngInfo 对象；EXIF 走独立的 exif 参数（eXIf 块）
+        kwargs = {
+            'format': 'PNG',
+            'pnginfo': _build_pnginfo(metadata.get('png_info')),
+            'optimize': is_lossless,
+        }
+        if exif:
+            kwargs['exif'] = exif
+        image.save(output_path, **kwargs)
 
     elif ext == '.webp':
-        exif = metadata.get('exif')
-        # 传给 Save 的 exif 不能为 None，否则 Pillow 报错
-        exif_bytes = exif if exif else piexif.dump({})
+        kwargs = {'format': 'WEBP', 'method': webp_method}
         if is_lossless:
-            image.save(output_path, format='WEBP', lossless=True,
-                       method=webp_method, exif=exif_bytes)
+            kwargs['lossless'] = True
         else:
-            image.save(output_path, format='WEBP', quality=quality,
-                       method=webp_method, exif=exif_bytes)
+            kwargs['quality'] = quality
+        # 无 EXIF 时不传 exif，避免空元数据写入
+        if exif:
+            kwargs['exif'] = exif
+        image.save(output_path, **kwargs)
 
     elif ext in ('.jpg', '.jpeg'):
-        exif = metadata.get('exif')
+        image = _flatten_for_jpeg(image)
         kwargs = {'format': 'JPEG'}
         if is_lossless:
             # JPEG 不支持真正无损，使用最高质量 100 + 优化
@@ -114,26 +165,83 @@ def save_with_metadata(image, output_path, metadata, save_mode='lossy', quality=
         image.save(output_path)
 
 
+# ==================== 输出格式 ====================
+
+FORMAT_ORIGINAL = 'original'
+# 输出格式 -> 目标扩展名（原格式不在此表中，保持源扩展名）
+FORMAT_EXTENSIONS = {'webp': '.webp', 'jpg': '.jpg', 'png': '.png'}
+FORMAT_LABELS = {'original': '原格式', 'webp': 'WebP', 'jpg': 'JPEG', 'png': 'PNG'}
+FORMAT_VALUES = {label: value for value, label in FORMAT_LABELS.items()}
+FORMAT_CHOICES = ['原格式', 'WebP', 'JPEG', 'PNG']
+
+
+def apply_output_format(path, output_format):
+    """按输出格式替换文件扩展名；原格式/未知格式返回原路径。"""
+    ext = FORMAT_EXTENSIONS.get(output_format)
+    if not ext:
+        return path
+    return os.path.splitext(path)[0] + ext
+
+
 # ==================== 任务构建与进度持久化 ====================
 
-def build_tasks(sources, output_dir, recursive=True):
+def _path_key(path):
+    """用于比较路径是否指向同一文件的规范化键。"""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _allocate_output_path(out_path, protected, used):
+    """分配输出路径。
+
+    - protected: 所有源文件路径键，任何输出都不得与源文件同名
+      （输出目录恰好等于源目录时自动加 _upscaled 后缀，避免覆盖原图）
+    - used: 本批次已分配的输出路径键，避免不同源图转换格式后撞名
+      （如 a.png 与 a.jpg 都输出 a.jpg）时互相覆盖
+    """
+    base, ext = os.path.splitext(out_path)
+    candidate = out_path
+    suffix = 0
+    while (_path_key(candidate) in protected
+           or _path_key(candidate) in used):
+        suffix += 1
+        candidate = f"{base}_upscaled{'' if suffix == 1 else suffix}{ext}"
+    used.add(_path_key(candidate))
+    return candidate
+
+
+def build_tasks(sources, output_dir, recursive=True, output_format=FORMAT_ORIGINAL):
     """将源(文件或文件夹列表)展开为任务列表。
 
     每个任务: (rel_path, source_path, out_path)。
     - 单个文件: 直接输出到输出目录
     - 文件夹: 源文件夹名作为输出目录的一级文件夹名, 内部保留相对结构
+    - output_format: 'original' 保持源扩展名, 或 'webp'/'jpg'/'png' 统一转换
     """
-    tasks = []
+    # 先展开所有源文件：输出路径不得与任何源文件相同（防止输出目录=源目录时覆盖原图）
+    expanded = []
     for source in sources:
         if os.path.isfile(source):
-            rel_path = os.path.basename(source)
-            tasks.append((rel_path, source, os.path.join(output_dir, rel_path)))
+            expanded.append((source, [source]))
         elif os.path.isdir(source):
+            expanded.append((source, scan_images(source, recursive)))
+
+    protected = {_path_key(f) for _, files in expanded for f in files}
+    used = set()
+    tasks = []
+
+    for source, files in expanded:
+        if os.path.isfile(source):
+            rel_path = os.path.basename(source)
+            out_path = apply_output_format(os.path.join(output_dir, rel_path), output_format)
+            tasks.append((rel_path, source, _allocate_output_path(out_path, protected, used)))
+        else:
             folder_name = os.path.basename(os.path.normpath(source))
             base = os.path.join(output_dir, folder_name)
-            for f in scan_images(source, recursive):
+            for f in files:
                 rel = os.path.relpath(f, source)
-                tasks.append((os.path.join(folder_name, rel), f, os.path.join(base, rel)))
+                display_rel = os.path.join(folder_name, rel)
+                out_path = apply_output_format(os.path.join(base, rel), output_format)
+                tasks.append((display_rel, f, _allocate_output_path(out_path, protected, used)))
     return tasks
 
 
@@ -315,9 +423,11 @@ class UpscaleWorker:
         self.log_callback(f"💾 保存模式: {mode_label}"
                           f"{f', 质量: {config.quality}%' if config.save_mode == 'lossy' else ''}"
                           f", WebP method={config.webp_method}")
+        self.log_callback(f"🖼 输出格式: {FORMAT_LABELS.get(config.output_format, '原格式')}")
 
         # 构建任务列表
-        tasks = build_tasks(config.sources, config.output_dir, config.recursive)
+        tasks = build_tasks(config.sources, config.output_dir, config.recursive,
+                            config.output_format)
         total = len(tasks)
         if total == 0:
             self.log_callback("❌ 未找到支持的图片文件")
@@ -484,6 +594,7 @@ class Config:
         self.recursive = True
         self.preserve_metadata = True
         self.debug = False
+        self.output_format = FORMAT_ORIGINAL  # 'original' | 'webp' | 'jpg' | 'png'
         self.save_mode = 'lossy'       # 'lossy' | 'lossless'
         self.quality = 90              # 1-100, lossy 时有效
         self.webp_method = 6           # 0-6, WebP 压缩方法（6=最慢但最小）
@@ -638,6 +749,7 @@ class UpscaleGUI:
         self._poll_log_queue()
         # 初始化质量控件的状态
         self._on_quality_mode_change()
+        self._on_format_change()
         # 尝试恢复上次未完成的进度
         self._try_restore()
 
@@ -729,16 +841,30 @@ class UpscaleGUI:
         ttk.Label(quality_frame, text=hint, foreground="#999",
                   font=('', 8)).grid(row=1, column=0, columnspan=7, sticky=tk.W, pady=(5, 0))
 
+        # 输出格式
+        format_row = ttk.Frame(quality_frame)
+        format_row.grid(row=2, column=0, columnspan=7, sticky=tk.W, pady=(5, 0))
+
+        ttk.Label(format_row, text="  输出格式:").pack(side=tk.LEFT, padx=(16, 4))
+        self.format_var = tk.StringVar(value=FORMAT_LABELS[FORMAT_ORIGINAL])
+        self.format_combo = ttk.Combobox(format_row, textvariable=self.format_var, width=8,
+                                         values=FORMAT_CHOICES, state="readonly")
+        self.format_combo.pack(side=tk.LEFT)
+        self.format_combo.bind('<<ComboboxSelected>>', lambda _e: self._on_format_change())
+        ttk.Label(format_row, text="（原格式=沿用源文件扩展名）",
+                  foreground="gray").pack(side=tk.LEFT, padx=4)
+
         # WebP 压缩方法
         row3 = ttk.Frame(quality_frame)
-        row3.grid(row=2, column=0, columnspan=7, sticky=tk.W, pady=(5, 0))
+        row3.grid(row=3, column=0, columnspan=7, sticky=tk.W, pady=(5, 0))
 
         ttk.Label(row3, text="  压缩方法:").pack(side=tk.LEFT, padx=(16, 4))
         self.webp_method_var = tk.StringVar(value="6")
-        method_combo = ttk.Combobox(row3, textvariable=self.webp_method_var, width=8,
-                                    values=list(range(7)), state="readonly")
-        method_combo.pack(side=tk.LEFT)
-        ttk.Label(row3, text="(0=最快, 6=压缩率最高)", foreground="gray").pack(side=tk.LEFT, padx=4)
+        self.webp_method_combo = ttk.Combobox(row3, textvariable=self.webp_method_var, width=8,
+                                              values=list(range(7)), state="readonly")
+        self.webp_method_combo.pack(side=tk.LEFT)
+        ttk.Label(row3, text="(0=最快, 6=压缩率最高, 仅 WebP 有效)",
+                  foreground="gray").pack(side=tk.LEFT, padx=4)
 
         quality_frame.columnconfigure(6, weight=1)
 
@@ -872,6 +998,13 @@ class UpscaleGUI:
         is_lossy = self.save_mode_var.get() == 'lossy'
         state = tk.NORMAL if is_lossy else tk.DISABLED
         self.quality_scale.config(state=state)
+
+    def _on_format_change(self):
+        """输出格式变化时，JPEG/PNG 目标禁用 WebP 专用压缩方法"""
+        fmt = FORMAT_VALUES.get(self.format_var.get(), FORMAT_ORIGINAL)
+        # ttk.Combobox 恢复正常时应回到 readonly，避免变成可编辑状态
+        state = tk.DISABLED if fmt in ('jpg', 'png') else 'readonly'
+        self.webp_method_combo.config(state=state)
 
     def _on_quality_scale(self, value):
         """质量滑块拖动时更新百分比标签"""
@@ -1024,6 +1157,7 @@ class UpscaleGUI:
         self.config.save_mode = self.save_mode_var.get()
         self.config.quality = self.quality_var.get()
         self.config.webp_method = int(self.webp_method_var.get())
+        self.config.output_format = FORMAT_VALUES.get(self.format_var.get(), FORMAT_ORIGINAL)
 
         # 解析尺寸
         try:
@@ -1073,7 +1207,8 @@ class UpscaleGUI:
 
         # 准备会话状态（新会话或恢复）
         if self._resumed and self._saved_state:
-            state_data = self._saved_state
+            # 恢复：沿用上次的完成数与下一张路径，用于断点续跑
+            state_data = dict(self._saved_state)
             self._resumed = False
             self._saved_state = None
         else:
@@ -1083,29 +1218,38 @@ class UpscaleGUI:
                 'active': True,
                 'session_id': uuid.uuid4().hex,
                 'done': 0,
-                'sources': self.config.sources,
-                'output_dir': self.config.output_dir,
-                'recursive': self.config.recursive,
-                'mode': self.config.mode,
-                # 放大参数
-                'target_width': self.config.target_width,
-                'target_height': self.config.target_height,
-                'auto_swap_wh': self.config.auto_swap_wh,
-                'scale_factor': self.config.scale_factor,
-                'upscaler_name': self.config.upscaler_name,
-                # 保存质量
-                'save_mode': self.config.save_mode,
-                'quality': self.config.quality,
-                'webp_method': self.config.webp_method,
-                'preserve_metadata': self.config.preserve_metadata,
-                # WebUI 连接
-                'host': self.config.host,
-                'port': self.config.port,
-                'debug': self.config.debug,
-                'date': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'total': 0,
+                'next_path': '',
             }
             self._session_total = 0
             self._session_done = 0
+
+        # 用本次界面参数覆盖存档参数（恢复时同样刷新，避免下次恢复出旧参数）
+        state_data.update({
+            'version': 1,
+            'active': True,
+            'sources': self.config.sources,
+            'output_dir': self.config.output_dir,
+            'recursive': self.config.recursive,
+            'mode': self.config.mode,
+            # 放大参数
+            'target_width': self.config.target_width,
+            'target_height': self.config.target_height,
+            'auto_swap_wh': self.config.auto_swap_wh,
+            'scale_factor': self.config.scale_factor,
+            'upscaler_name': self.config.upscaler_name,
+            # 保存设置
+            'output_format': self.config.output_format,
+            'save_mode': self.config.save_mode,
+            'quality': self.config.quality,
+            'webp_method': self.config.webp_method,
+            'preserve_metadata': self.config.preserve_metadata,
+            # WebUI 连接
+            'host': self.config.host,
+            'port': self.config.port,
+            'debug': self.config.debug,
+            'date': time.strftime('%Y-%m-%d %H:%M:%S'),
+        })
 
         # 启动工作线程
         self.worker = UpscaleWorker(
@@ -1236,6 +1380,9 @@ class UpscaleGUI:
             self.quality_label.config(text=f"{data['quality']}%")
         if 'webp_method' in data:
             self.webp_method_var.set(str(data['webp_method']))
+        if 'output_format' in data:
+            self.format_var.set(FORMAT_LABELS.get(data['output_format'], FORMAT_LABELS[FORMAT_ORIGINAL]))
+            self._on_format_change()
         if 'preserve_metadata' in data:
             self.preserve_meta_var.set(data['preserve_metadata'])
         # 恢复连接参数
